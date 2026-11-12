@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Large generated CSV files (users can generate them with python data/generator.py)
+data/raw/*.csv
+data/processed/*.csv
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+
+# Logs
+logs/*.log
+
+# Environments & IDEs
+.env
+.venv
+env/
+venv/
+.vscode/
+.idea/
+
+# Streamlit
+.streamlit/

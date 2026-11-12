@@ -1,0 +1,23 @@
+# ============================================================
+# AI Data Pipeline Root Cause Analysis & Recovery Assistant
+# Core Dependencies
+# ============================================================
+
+# Data Processing & Storage
+pandas>=2.2.0
+numpy>=1.26.0
+psycopg2-binary>=2.9.9
+SQLAlchemy>=2.0.25
+
+# Machine Learning & Graph Theory
+networkx>=3.2.1
+scikit-learn>=1.4.0
+matplotlib>=3.8.2
+
+# Interactive Dashboard
+streamlit>=1.31.0
+
+# LLM Providers (Optional for external keys)
+# google-generativeai>=0.4.0
+# openai>=1.12.0
+
