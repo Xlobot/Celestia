@@ -11,3 +11,4 @@ DROP TABLE IF EXISTS job_execution_logs CASCADE;
 DROP TABLE IF EXISTS pipeline_jobs      CASCADE;
 
 \i 'db/schema.sql'
+
