@@ -192,8 +192,11 @@ class RecoveryEngine:
             for alert in row_chk + null_chk + schema_chk:
                 remaining_anomalies.append(alert["detail"])
 
-        is_resolved = len(remaining_anomalies) == 0 and all(
-            s == "success" for s in execution_results.values()
+        # Bug fix: Ensure execution_results is not empty, all runs succeeded, and zero anomalies remain
+        is_resolved = (
+            bool(execution_results)
+            and all(s == "success" for s in execution_results.values())
+            and len(remaining_anomalies) == 0
         )
 
         resolution_status = "resolved" if is_resolved else "investigating"
@@ -202,18 +205,29 @@ class RecoveryEngine:
             f"Post-verification: {'All clear' if is_resolved else 'Unresolved: ' + str(remaining_anomalies)}"
         )
 
-        # Update database with resolution
-        execute(
-            """
-            UPDATE incidents SET
-                status = %s,
-                resolution_notes = %s,
-                resolved_at = NOW(),
-                resolved_by = %s
-            WHERE incident_id = %s
-            """,
-            (resolution_status, notes, approved_by, incident_id)
-        )
+        # Update database: only record resolved_at / resolved_by if the incident is truly resolved
+        if is_resolved:
+            execute(
+                """
+                UPDATE incidents SET
+                    status = 'resolved',
+                    resolution_notes = %s,
+                    resolved_at = NOW(),
+                    resolved_by = %s
+                WHERE incident_id = %s
+                """,
+                (notes, approved_by, incident_id)
+            )
+        else:
+            execute(
+                """
+                UPDATE incidents SET
+                    status = 'investigating',
+                    resolution_notes = %s
+                WHERE incident_id = %s
+                """,
+                (notes, incident_id)
+            )
 
         print(f"\nFinal Incident Status: {resolution_status.upper()}")
         print(f"Notes: {notes}\n")
@@ -225,6 +239,19 @@ class RecoveryEngine:
             "is_resolved": is_resolved,
             "notes": notes,
         }
+
+    def admin_force_recovery(
+        self,
+        incident_id: int,
+        admin_user: str,
+        reason: str
+    ) -> Dict[str, Any]:
+        """
+        Explicit administrative override to bypass safety checks.
+        Requires explicit admin_user identity and reason for audit logging.
+        """
+        print(f"\n[SECURITY AUDIT] Administrative override triggered for Incident #{incident_id} by {admin_user}: {reason}")
+        return self.execute_recovery(incident_id, approved_by=f"[ADMIN_OVERRIDE: {admin_user}]", force=True)
 
 
 # ─────────────────────────────────────────────────────────────

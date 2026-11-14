@@ -113,6 +113,19 @@ def run_monitoring(run_date: date) -> list[dict]:
             print(f"    -> Incident #{incident_id}: [{anomaly['severity'].upper()}] "
                   f"{anomaly['trigger_type']} on {anomaly['dataset']}")
 
+        # ── Automatically invoke RCA to populate ranked causes ───
+        print("\n  Triggering Root Cause Analysis on newly created incidents...")
+        try:
+            from src.rca.engine import RootCauseEngine
+            rca_engine = RootCauseEngine()
+            for anomaly in incidents_created:
+                inc_id = anomaly["incident_id"]
+                rca_res = rca_engine.investigate_incident(inc_id)
+                top_c = rca_res.get("top_root_cause", "Unknown")
+                print(f"    [RCA Resolved] Incident #{inc_id} attributed to: {top_c}")
+        except Exception as rca_err:
+            print(f"    [WARNING] Automated RCA failed to run: {rca_err}")
+
     print(f"\n{'='*60}")
     print(f"  Monitoring complete. {len(incidents_created)} incident(s) opened.")
     print(f"{'='*60}\n")

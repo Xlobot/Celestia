@@ -1,42 +1,37 @@
 """
 Database connection manager for the Pipeline RCA system.
-
-Why a separate connection module?
-  - One place to change DB credentials / host
-  - Every other module just imports `get_connection()` - no repeated config
-  - Later we can swap this for environment variables or a secrets manager
-
-Usage:
-    from db.connection import get_connection, get_engine
-
-    # For raw psycopg2 (direct SQL):
-    with get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM pipeline_jobs")
-
-    # For pandas (read SQL into DataFrame):
-    from db.connection import get_engine
-    df = pd.read_sql("SELECT * FROM pipeline_jobs", get_engine())
+Loads credentials dynamically from environment variables / .env.
 """
 
+import os
 import psycopg2
-import psycopg2.extras  # gives us dict-style cursor rows
-from sqlalchemy import create_engine, text
+import psycopg2.extras
+from sqlalchemy import create_engine
 from sqlalchemy.engine import Engine
-import pandas as pd
+from pathlib import Path
+
+# Load .env file manually if present (avoids strict dependency on python-dotenv)
+_env_file = Path(__file__).resolve().parent.parent / ".env"
+if _env_file.exists():
+    with open(_env_file, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
 
 # ─────────────────────────────────────────────
-# CONFIG - change these if your setup differs
+# DYNAMIC CONFIG FROM ENVIRONMENT
 # ─────────────────────────────────────────────
 DB_CONFIG = {
-    "host":     "localhost",
-    "port":     5432,
-    "dbname":   "pipeline_rca",
-    "user":     "postgres",
-    "password": "123",
+    "host":     os.environ.get("DB_HOST", "localhost"),
+    "port":     int(os.environ.get("DB_PORT", 5432)),
+    "dbname":   os.environ.get("DB_NAME", "pipeline_rca"),
+    "user":     os.environ.get("DB_USER", "postgres"),
+    "password": os.environ.get("DB_PASSWORD", "123"),
 }
 
-# SQLAlchemy connection string (used by pandas read_sql / to_sql)
+# SQLAlchemy connection string
 _DB_URL = (
     f"postgresql+psycopg2://{DB_CONFIG['user']}:{DB_CONFIG['password']}"
     f"@{DB_CONFIG['host']}:{DB_CONFIG['port']}/{DB_CONFIG['dbname']}"
@@ -44,32 +39,17 @@ _DB_URL = (
 
 
 def get_connection() -> psycopg2.extensions.connection:
-    """
-    Returns a raw psycopg2 connection.
-    Use this when you want full control over SQL execution.
-
-    Always use as a context manager:
-        with get_connection() as conn:
-            ...
-    The context manager auto-commits on success, rolls back on error.
-    """
+    """Returns a raw psycopg2 connection."""
     return psycopg2.connect(**DB_CONFIG)
 
 
 def get_engine() -> Engine:
-    """
-    Returns a SQLAlchemy engine.
-    Use this with pandas .read_sql() and .to_sql().
-    The engine is NOT recreated on every call (pool is reused).
-    """
+    """Returns a SQLAlchemy engine."""
     return create_engine(_DB_URL)
 
 
 def test_connection() -> bool:
-    """
-    Quick sanity check - returns True if DB is reachable.
-    Run this to confirm setup is working.
-    """
+    """Quick sanity check - returns True if DB is reachable."""
     try:
         with get_connection() as conn:
             with conn.cursor() as cur:
@@ -82,13 +62,7 @@ def test_connection() -> bool:
 
 
 def fetch_all(query: str, params: tuple = None) -> list[dict]:
-    """
-    Run a SELECT and return all rows as a list of dicts.
-
-    Example:
-        rows = fetch_all("SELECT * FROM pipeline_jobs WHERE is_active = %s", (True,))
-        print(rows[0]["job_name"])
-    """
+    """Run a SELECT and return all rows as a list of dicts."""
     with get_connection() as conn:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(query, params)
@@ -96,16 +70,7 @@ def fetch_all(query: str, params: tuple = None) -> list[dict]:
 
 
 def execute(query: str, params: tuple = None) -> None:
-    """
-    Run an INSERT / UPDATE / DELETE statement.
-    Auto-commits on success.
-
-    Example:
-        execute(
-            "INSERT INTO incidents (run_date, trigger_type, severity) VALUES (%s, %s, %s)",
-            ('2026-11-12', 'row_count_anomaly', 'high')
-        )
-    """
+    """Run an INSERT / UPDATE / DELETE statement."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
@@ -113,45 +78,10 @@ def execute(query: str, params: tuple = None) -> None:
 
 
 def execute_returning(query: str, params: tuple = None):
-    """
-    Run an INSERT ... RETURNING and get back the generated value.
-    Useful for getting the auto-generated primary key after an insert.
-
-    Example:
-        incident_id = execute_returning(
-            "INSERT INTO incidents (...) VALUES (...) RETURNING incident_id",
-            (...)
-        )
-    """
+    """Run an INSERT ... RETURNING and get back the generated value."""
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(query, params)
             result = cur.fetchone()
         conn.commit()
     return result[0] if result else None
-
-
-# ─────────────────────────────────────────────
-# Quick self-test when run directly
-# ─────────────────────────────────────────────
-if __name__ == "__main__":
-    print("Testing database connection...")
-
-    if test_connection():
-        print("[PASS] Connected to pipeline_rca successfully\n")
-
-        # Show all registered pipeline jobs
-        jobs = fetch_all("SELECT job_id, job_name, sla_max_duration_sec FROM pipeline_jobs ORDER BY job_id")
-        print(f"Registered pipeline jobs ({len(jobs)}):")
-        for job in jobs:
-            print(f"  - {job['job_id']:35s}  SLA: {job['sla_max_duration_sec']}s")
-
-        # Show table row counts
-        print("\nTable row counts:")
-        tables = ["pipeline_jobs", "job_execution_logs", "dataset_snapshots", "incidents"]
-        for table in tables:
-            rows = fetch_all(f"SELECT COUNT(*) AS cnt FROM {table}")
-            print(f"  {table:30s}  {rows[0]['cnt']} rows")
-    else:
-        print("[FAIL] Could not connect. Check DB_CONFIG settings.")
-

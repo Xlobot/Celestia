@@ -24,7 +24,7 @@ Anomaly dict structure:
 import json
 import numpy as np
 import pandas as pd
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Optional
 
 import sys
@@ -108,58 +108,56 @@ def _iqr_bounds(values: list[float], k: float = 1.5) -> tuple[float, float]:
 def check_freshness(
     dataset_name: str,
     run_date: date,
-    max_age_hours: int = 25,       # allow up to 25h (1 day + buffer)
+    max_age_hours: int = 25,       # SLA threshold in hours
+    as_of_time: Optional[datetime] = None,
 ) -> list[dict]:
     """
-    Check whether a dataset has been updated recently enough.
+    Check whether a dataset has been updated within its SLA window.
 
-    We look for a snapshot within max_age_hours of run_date.
-    If none found -> freshness violation.
-
-    Why 25h not 24h?
-      Pipeline scheduling has natural drift. A job scheduled at 2am
-      might run at 2:03am. 24h exactly would fire a false alert.
-      25h gives a reasonable buffer.
+    Measures true elapsed time between the latest snapshot's TIMESTAMPTZ
+    and as_of_time (or current time), comparing against max_age_hours.
     """
-    # Look for any snapshot on run_date itself
-    rows = fetch_all(
+    latest_rows = fetch_all(
         """
-        SELECT snapshot_date, row_count
+        SELECT snapshot_date, created_at, row_count
         FROM dataset_snapshots
-        WHERE dataset_name = %s
-          AND snapshot_date = %s
+        WHERE dataset_name = %s AND snapshot_date <= %s
+        ORDER BY created_at DESC
+        LIMIT 1
         """,
         (dataset_name, run_date)
     )
 
-    if rows:
-        return []   # Snapshot exists for today -> fresh
-
-    # Look for most recent snapshot
-    latest = fetch_all(
-        """
-        SELECT snapshot_date FROM dataset_snapshots
-        WHERE dataset_name = %s
-        ORDER BY snapshot_date DESC
-        LIMIT 1
-        """,
-        (dataset_name,)
-    )
-
-    if not latest:
-        # Never seen this dataset before
+    if not latest_rows:
         return [{
             "check":        "freshness_violation",
             "dataset":      dataset_name,
             "severity":     "high",
             "trigger_type": "freshness_violation",
-            "detail":       f"No historical snapshots found for '{dataset_name}'",
-            "evidence":     {"last_seen": None, "max_age_hours": max_age_hours},
+            "detail":       f"No historical snapshots found for '{dataset_name}' on or before {run_date}",
+            "evidence":     {"last_seen": None, "sla_hours": max_age_hours},
         }]
 
-    last_date = latest[0]["snapshot_date"]
-    age_days  = (run_date - last_date).days
-    age_hours = age_days * 24
+    latest = latest_rows[0]
+    last_created_at = latest["created_at"]
+    last_date = latest["snapshot_date"]
+
+    # If snapshot exists for this exact run date, it is fresh
+    if last_date == run_date:
+        return []
+
+    if as_of_time is None:
+        if run_date == date.today():
+            as_of_time = datetime.now(timezone.utc)
+        else:
+            as_of_time = datetime(run_date.year, run_date.month, run_date.day, 23, 59, 59, tzinfo=timezone.utc)
+
+    if last_created_at.tzinfo is None:
+        last_created_at = last_created_at.replace(tzinfo=timezone.utc)
+    if as_of_time.tzinfo is None:
+        as_of_time = as_of_time.replace(tzinfo=timezone.utc)
+
+    age_hours = (as_of_time - last_created_at).total_seconds() / 3600.0
 
     if age_hours > max_age_hours:
         severity = "critical" if age_hours > 72 else "high"
@@ -169,13 +167,14 @@ def check_freshness(
             "severity":     severity,
             "trigger_type": "freshness_violation",
             "detail":       (
-                f"Dataset '{dataset_name}' last updated {age_hours}h ago "
-                f"(SLA: {max_age_hours}h). Last snapshot: {last_date}"
+                f"Dataset '{dataset_name}' last updated {age_hours:.1f}h ago "
+                f"(SLA: {max_age_hours}h). Last snapshot: {last_date} ({last_created_at.strftime('%Y-%m-%d %H:%M:%S UTC')})"
             ),
             "evidence": {
                 "last_snapshot_date": str(last_date),
-                "age_hours":          age_hours,
-                "max_age_hours":      max_age_hours,
+                "last_created_at":    str(last_created_at),
+                "age_hours":          round(age_hours, 1),
+                "sla_hours":          max_age_hours,
             },
         }]
 
@@ -319,6 +318,9 @@ def check_row_count(
 
     # Determine severity based on how far outside the bounds we are
     pct_change = abs(today_count - median) / max(median, 1) * 100
+    if pct_change < 15.0:
+        return []  # Suppress alert noise for minor natural daily variance (< 15%)
+
     if pct_change > 70:
         severity = "critical"
     elif pct_change > 40:

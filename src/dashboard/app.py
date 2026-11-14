@@ -17,14 +17,49 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from db.connection import fetch_all, execute
-from src.graph.pipeline_graph import PipelineGraph
-from src.rca.engine import RootCauseEngine
-from src.llm.assistant import DiagnosticAssistant
-from src.recovery.recovery_engine import RecoveryEngine
-from pipelines.run_pipeline import run_pipeline
+
+# Lazy-loaded component singletons with defensive error trapping
+_GRAPH_INSTANCE = None
+_RCA_INSTANCE = None
+_ASSISTANT_INSTANCE = None
+_RECOVERY_INSTANCE = None
+
+def get_graph():
+    global _GRAPH_INSTANCE
+    if _GRAPH_INSTANCE is None:
+        from src.graph.pipeline_graph import PipelineGraph
+        _GRAPH_INSTANCE = PipelineGraph()
+    return _GRAPH_INSTANCE
+
+def reload_graph():
+    global _GRAPH_INSTANCE
+    from src.graph.pipeline_graph import PipelineGraph
+    _GRAPH_INSTANCE = PipelineGraph()
+    return _GRAPH_INSTANCE
+
+def get_rca():
+    global _RCA_INSTANCE
+    if _RCA_INSTANCE is None:
+        from src.rca.engine import RootCauseEngine
+        _RCA_INSTANCE = RootCauseEngine()
+    return _RCA_INSTANCE
+
+def get_assistant():
+    global _ASSISTANT_INSTANCE
+    if _ASSISTANT_INSTANCE is None:
+        from src.llm.assistant import DiagnosticAssistant
+        _ASSISTANT_INSTANCE = DiagnosticAssistant()
+    return _ASSISTANT_INSTANCE
+
+def get_recovery():
+    global _RECOVERY_INSTANCE
+    if _RECOVERY_INSTANCE is None:
+        from src.recovery.recovery_engine import RecoveryEngine
+        _RECOVERY_INSTANCE = RecoveryEngine()
+    return _RECOVERY_INSTANCE
 
 # ─────────────────────────────────────────────────────────────
-# PAGE CONFIGURATION
+# PAGE CONFIGURATION & STYLING
 # ─────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="Pipeline RCA & Recovery Assistant",
@@ -33,7 +68,6 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom Styling
 st.markdown("""
 <style>
     .metric-card {
@@ -49,26 +83,6 @@ st.markdown("""
     .badge-resolved { background-color: #28a745; color: white; padding: 3px 8px; border-radius: 4px; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
-
-
-# ─────────────────────────────────────────────────────────────
-# DATA HELPERS
-# ─────────────────────────────────────────────────────────────
-@st.cache_resource
-def get_graph():
-    return PipelineGraph()
-
-@st.cache_resource
-def get_rca():
-    return RootCauseEngine()
-
-@st.cache_resource
-def get_assistant():
-    return DiagnosticAssistant()
-
-@st.cache_resource
-def get_recovery():
-    return RecoveryEngine()
 
 
 def load_kpis():
@@ -223,7 +237,11 @@ with tab_graph:
     st.subheader("🕸️ Pipeline Lineage & Bipartite DAG")
     st.write("Models both **Jobs** (actions) and **Datasets** (state) to enable upstream root cause tracing and downstream blast radius calculation.")
 
-    pg = get_graph()
+    if st.button("🔄 Refresh Graph from Database"):
+        pg = reload_graph()
+        st.success("Graph refreshed from PostgreSQL!")
+    else:
+        pg = get_graph()
 
     st.markdown("#### Interactive Mermaid Architecture Lineage")
     st.code(pg.to_mermaid(), language="mermaid")

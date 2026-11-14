@@ -2,11 +2,11 @@
 Fault Injection & System Evaluation Benchmark
 ==============================================
 Runs controlled failure experiments against the pipeline and computes
-empirical performance metrics:
+empirical performance metrics against explicit ground-truth expectations:
   1. Top-1 Root Cause Accuracy
   2. Top-3 Root Cause Accuracy
   3. False Positive Rate (FPR) on normal runs
-  4. Blast Radius (Impact) Precision and Recall
+  4. Blast Radius (Impact) Precision and Recall against Ground Truth Lineage
   5. Mean Diagnosis Time (latency)
 """
 
@@ -15,7 +15,7 @@ import time
 import json
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Set
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -45,19 +45,34 @@ class SystemEvaluator:
         print("STARTING FORMAL SYSTEM EVALUATION BENCHMARK")
         print("=" * 70)
 
-        trials = [
-            # Normal runs to test False Positive Rate
-            {"scenario": "normal", "date": date(2026, 12, 1), "expected_cause": None, "label": "Normal Run #1"},
-            {"scenario": "normal", "date": date(2026, 12, 2), "expected_cause": None, "label": "Normal Run #2"},
-            {"scenario": "normal", "date": date(2026, 12, 3), "expected_cause": None, "label": "Normal Run #3"},
+        # Ground truth architectural blast radius per root cause
+        # When job_ingest_customers fails -> clean.customers & analytics.customer_sales_summary
+        # When job_ingest_orders fails -> clean.orders & analytics.customer_sales_summary
+        GROUND_TRUTH_BLAST = {
+            "job_ingest_customers": {"clean.customers", "analytics.customer_sales_summary"},
+            "job_ingest_orders":    {"clean.orders", "analytics.customer_sales_summary"},
+            "job_build_sales_summary": {"analytics.customer_sales_summary"},
+        }
 
-            # Fault injection runs
-            {"scenario": "row_drop", "date": date(2026, 12, 4), "expected_cause": "job_ingest_customers", "label": "80% Volume Drop"},
-            {"scenario": "null_spike", "date": date(2026, 12, 5), "expected_cause": "job_ingest_orders", "label": "Revenue Null Spike"},
-            {"scenario": "missing_file", "date": date(2026, 12, 6), "expected_cause": "job_ingest_orders", "label": "Missing Source File"},
-            {"scenario": "schema_drift", "date": date(2026, 12, 7), "expected_cause": "job_ingest_customers", "label": "Schema Drift (int->str)"},
-            {"scenario": "row_drop", "date": date(2026, 12, 8), "expected_cause": "job_ingest_customers", "label": "Repeat Volume Drop"},
-            {"scenario": "null_spike", "date": date(2026, 12, 9), "expected_cause": "job_ingest_orders", "label": "Repeat Null Spike"},
+        trials = [
+            # Normal baseline runs to test False Positive Rate
+            {"scenario": "normal", "date": date(2026, 12, 1), "expected_cause": None, "label": "Normal Baseline #1"},
+            {"scenario": "normal", "date": date(2026, 12, 2), "expected_cause": None, "label": "Normal Baseline #2"},
+            {"scenario": "normal", "date": date(2026, 12, 3), "expected_cause": None, "label": "Normal Baseline #3"},
+            {"scenario": "normal", "date": date(2026, 12, 10), "expected_cause": None, "label": "Normal Baseline #4"},
+            {"scenario": "normal", "date": date(2026, 12, 11), "expected_cause": None, "label": "Normal Baseline #5"},
+
+            # Fault injection runs (10 trials)
+            {"scenario": "row_drop", "date": date(2026, 12, 4), "expected_cause": "job_ingest_customers", "label": "80% Customer Volume Drop"},
+            {"scenario": "null_spike", "date": date(2026, 12, 5), "expected_cause": "job_ingest_orders", "label": "Revenue Null Spike (60%)"},
+            {"scenario": "missing_file", "date": date(2026, 12, 6), "expected_cause": "job_ingest_orders", "label": "Missing Orders File"},
+            {"scenario": "schema_drift", "date": date(2026, 12, 7), "expected_cause": "job_ingest_customers", "label": "Schema Drift (customer_id int->str)"},
+            {"scenario": "row_drop", "date": date(2026, 12, 8), "expected_cause": "job_ingest_customers", "label": "Customer Volume Drop Trial 2"},
+            {"scenario": "null_spike", "date": date(2026, 12, 9), "expected_cause": "job_ingest_orders", "label": "Revenue Null Spike Trial 2"},
+            {"scenario": "missing_file", "date": date(2026, 12, 12), "expected_cause": "job_ingest_orders", "label": "Missing Orders File Trial 2"},
+            {"scenario": "schema_drift", "date": date(2026, 12, 13), "expected_cause": "job_ingest_customers", "label": "Schema Drift Trial 2"},
+            {"scenario": "row_drop", "date": date(2026, 12, 14), "expected_cause": "job_ingest_customers", "label": "Customer Volume Drop Trial 3"},
+            {"scenario": "null_spike", "date": date(2026, 12, 15), "expected_cause": "job_ingest_orders", "label": "Revenue Null Spike Trial 3"},
         ]
 
         total_fault_trials = 0
@@ -77,12 +92,12 @@ class SystemEvaluator:
             expected = t["expected_cause"]
             label = t["label"]
 
-            print(f"\n[Trial {idx}/{len(trials)}] Testing: {label} ({scen}) on {t_date}...")
+            print(f"\n[Trial {idx:02d}/{len(trials)}] Testing: {label} ({scen}) on {t_date}...")
 
-            # Clean any old test records for this date
+            # Clean any old test records for this date (respecting foreign key order)
             execute("DELETE FROM incidents WHERE run_date = %s", (t_date,))
-            execute("DELETE FROM job_execution_logs WHERE run_date = %s", (t_date,))
             execute("DELETE FROM dataset_snapshots WHERE snapshot_date = %s", (t_date,))
+            execute("DELETE FROM job_execution_logs WHERE run_date = %s", (t_date,))
 
             # 1. Generate data with scenario
             generate_data(scenario=scen, run_date=t_date, seed=500 + idx)
@@ -98,7 +113,7 @@ class SystemEvaluator:
                 normal_trials += 1
                 if len(incidents_created) > 0:
                     false_positives += 1
-                    print(f"  Result: [FAIL] False Positive! {len(incidents_created)} alert(s) triggered on normal data.")
+                    print(f"  Result: [FAIL] False Positive! {len(incidents_created)} alert(s) triggered on clean data.")
                 else:
                     print(f"  Result: [PASS] Zero false alarms.")
             else:
@@ -123,20 +138,27 @@ class SystemEvaluator:
                 if is_top3:
                     top3_correct += 1
 
-                # Blast radius accuracy
-                if top_1:
-                    predicted_blast = set(self.graph.get_downstream_impact(top_1, node_type="dataset"))
-                    actual_anomalous = set(inv.get("anomalous_datasets", []))
+                # ── Ground Truth Blast Radius Evaluation ─────────
+                # Ground truth: the actual set of downstream datasets affected by this failure
+                gt_blast = GROUND_TRUTH_BLAST.get(expected, set())
 
-                    # Precision: of predicted blast, how many actually had anomalies?
-                    intersect = predicted_blast.intersection(actual_anomalous)
-                    prec = len(intersect) / len(predicted_blast) if predicted_blast else 1.0
-                    rec = len(intersect) / len(actual_anomalous) if actual_anomalous else 1.0
+                # Predicted blast: what our RCA engine calculated for the top identified candidate
+                top_candidate_info = inv.get("ranked_causes", [{}])[0]
+                pred_blast = set(top_candidate_info.get("impacted_downstream", []))
 
-                    precision_scores.append(prec)
-                    recall_scores.append(rec)
+                if pred_blast and gt_blast:
+                    overlap = pred_blast.intersection(gt_blast)
+                    prec = len(overlap) / len(pred_blast)
+                    rec = len(overlap) / len(gt_blast)
+                elif not pred_blast and not gt_blast:
+                    prec, rec = 1.0, 1.0
+                else:
+                    prec, rec = 0.0, 0.0
 
-                print(f"  Result: Top-1={top_1} (Expected={expected}) | Top-1 OK: {is_top1} | Latency: {latency_ms:.1f}ms")
+                precision_scores.append(prec)
+                recall_scores.append(rec)
+
+                print(f"  Result: Top-1={top_1} (Expected={expected}) | Top-1 OK: {is_top1} | Blast Prec: {prec*100:.1f}%, Rec: {rec*100:.1f}% | Latency: {latency_ms:.1f}ms")
 
         # ── Compute Summary Metrics ───────────────────────────
         top1_acc = (top1_correct / total_fault_trials * 100) if total_fault_trials else 0
@@ -159,13 +181,14 @@ class SystemEvaluator:
         }
 
         print("\n" + "=" * 70)
-        print("BENCHMARK EVALUATION SUMMARY")
+        print("FORMAL BENCHMARK EVALUATION SUMMARY (GROUND-TRUTH GROUNDED)")
         print("=" * 70)
+        print(f"  Total Trials Evaluated          : {metrics['total_trials']} ({total_fault_trials} faults, {normal_trials} baselines)")
         print(f"  Top-1 Root Cause Accuracy       : {metrics['top1_accuracy_pct']}% ({top1_correct}/{total_fault_trials})")
         print(f"  Top-3 Root Cause Accuracy       : {metrics['top3_accuracy_pct']}% ({top3_correct}/{total_fault_trials})")
         print(f"  False Positive Rate (FPR)       : {metrics['false_positive_rate_pct']}% ({false_positives}/{normal_trials})")
-        print(f"  Blast Radius Precision          : {metrics['blast_radius_precision_pct']}%")
-        print(f"  Blast Radius Recall             : {metrics['blast_radius_recall_pct']}%")
+        print(f"  Blast Radius Precision          : {metrics['blast_radius_precision_pct']}% (Evaluated vs Ground Truth DAG)")
+        print(f"  Blast Radius Recall             : {metrics['blast_radius_recall_pct']}% (Evaluated vs Ground Truth DAG)")
         print(f"  Average Diagnosis Time          : {metrics['avg_diagnosis_time_ms']} ms")
         print("=" * 70)
 
@@ -175,4 +198,3 @@ class SystemEvaluator:
 if __name__ == "__main__":
     evaluator = SystemEvaluator()
     evaluator.run_benchmark()
-

@@ -16,6 +16,7 @@ import json
 from datetime import date
 from pathlib import Path
 from typing import List, Dict, Any, Optional
+from collections import defaultdict
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -33,6 +34,41 @@ class RootCauseEngine:
     def __init__(self):
         self.graph = PipelineGraph()
         self.ml_detector = JobExecutionAnomalyDetector(contamination=0.08)
+
+    def _is_dataset_available(self, dataset_name: str, run_date: date) -> bool:
+        """Checks if a dataset had a snapshot or source file on this date."""
+        snaps = fetch_all(
+            "SELECT snapshot_id FROM dataset_snapshots WHERE dataset_name = %s AND snapshot_date = %s",
+            (dataset_name, run_date)
+        )
+        return len(snaps) > 0
+
+    def _select_relevant_execution(self, executions: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        """
+        Given multiple runs of a job on the same date, selects the most relevant
+        execution for root cause investigation.
+        Prioritizes: failed > partial_load_warning > skipped > latest run.
+        """
+        if not executions:
+            return None
+
+        # Look for explicit failures first
+        for ex in executions:
+            if ex["status"] == "failed":
+                return ex
+
+        # Look for warnings next
+        for ex in executions:
+            if ex["status"] == "partial_load_warning":
+                return ex
+
+        # Look for skipped runs
+        for ex in executions:
+            if ex["status"] == "skipped":
+                return ex
+
+        # Default to the latest execution
+        return executions[-1]
 
     def investigate_incident(self, incident_id: int) -> Dict[str, Any]:
         """
@@ -63,7 +99,7 @@ class RootCauseEngine:
         """
         Runs comprehensive root cause analysis for all symptoms observed on `run_date`.
         """
-        # 1. Fetch all job executions for this date
+        # 1. Fetch all job executions for this date (retaining ALL runs via defaultdict)
         exec_rows = fetch_all(
             """
             SELECT execution_id, job_id, run_date, started_at, ended_at,
@@ -75,7 +111,9 @@ class RootCauseEngine:
             """,
             (run_date,)
         )
-        exec_map = {row["job_id"]: row for row in exec_rows}
+        exec_map = defaultdict(list)
+        for row in exec_rows:
+            exec_map[row["job_id"]].append(row)
 
         # 2. Fetch all incidents / anomalies for this date
         incidents = fetch_all(
@@ -109,17 +147,24 @@ class RootCauseEngine:
 
         # 4. Evaluate and score all candidate jobs
         candidates = []
-        registered_jobs = fetch_all("SELECT job_id, job_name, input_datasets, output_datasets FROM pipeline_jobs")
+        registered_jobs = fetch_all("SELECT job_id, job_name, input_datasets, output_datasets, is_active FROM pipeline_jobs")
 
         for job_meta in registered_jobs:
             job_id = job_meta["job_id"]
-            job_exec = exec_map.get(job_id)
+            job_execs = exec_map.get(job_id, [])
+            job_exec = self._select_relevant_execution(job_execs)
 
             score = 0
             evidence_points = []
 
+            outputs = job_meta["output_datasets"]
+            if isinstance(outputs, str):
+                outputs = json.loads(outputs)
+            inputs = job_meta["input_datasets"]
+            if isinstance(inputs, str):
+                inputs = json.loads(inputs)
+
             # ── Factor 1: Upstream Lineage ───────────────────────
-            # Check if this job is upstream of any of the affected datasets
             is_upstream = False
             for ds in target_datasets:
                 ancestors = self.graph.get_upstream_ancestors(ds, node_type="job")
@@ -136,29 +181,38 @@ class RootCauseEngine:
             # ── Factor 2: Job Execution Status ───────────────────
             if job_exec:
                 status = job_exec["status"]
+                total_runs = len(job_execs)
+                run_note = f" (run 1 of {total_runs})" if total_runs > 1 else ""
+
                 if status == "failed":
                     score += 35
                     err_type = job_exec.get("error_type") or "JobFailed"
                     err_msg = job_exec.get("error_message") or ""
                     evidence_points.append(
-                        f"Job execution explicitly failed with status 'failed' ({err_type}: {err_msg})."
+                        f"Job execution failed with status 'failed'{run_note} ({err_type}: {err_msg})."
                     )
                 elif status == "partial_load_warning":
                     score += 25
                     evidence_points.append(
-                        f"Job completed with a 'partial_load_warning' (data quality degradation detected during run)."
+                        f"Job completed with a 'partial_load_warning'{run_note} (data quality degradation detected during run)."
                     )
                 elif status == "skipped":
                     score += 10
                     evidence_points.append(
-                        f"Job was skipped due to an upstream dependency failure."
+                        f"Job was skipped{run_note} due to an upstream dependency failure."
                     )
             else:
                 # Job never ran on this date!
-                score += 30
-                evidence_points.append(
-                    f"Job did not execute on {run_date} (missing run record)."
-                )
+                # ONLY penalize if the job was expected to run:
+                # (Job is active, is upstream of incident, and its input datasets were available)
+                is_active = job_meta.get("is_active", True)
+                inputs_ready = all(self._is_dataset_available(ds, run_date) for ds in inputs) if inputs else True
+
+                if is_active and is_upstream and inputs_ready:
+                    score += 25
+                    evidence_points.append(
+                        f"Job '{job_id}' is active and upstream inputs were ready, but it did not execute on {run_date}."
+                    )
 
             # ── Factor 3: Input/Output Anomaly Association ───────
             # Did this job produce or consume an anomalous dataset?
@@ -192,7 +246,7 @@ class RootCauseEngine:
                 # Check if upstream jobs from this one are clean
                 upstream_of_job = self.graph.get_upstream_ancestors(job_id, node_type="job")
                 upstream_failed = any(
-                    exec_map.get(uj, {}).get("status") in ("failed", "partial_load_warning")
+                    any(run.get("status") in ("failed", "partial_load_warning") for run in exec_map.get(uj, []))
                     for uj in upstream_of_job
                 )
                 if not upstream_failed:

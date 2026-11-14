@@ -22,3 +22,7 @@ venv/
 
 # Streamlit
 .streamlit/
+
+# Archives & Caches
+*.zip
+.pytest_cache/
